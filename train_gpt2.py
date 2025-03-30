@@ -18,6 +18,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -62,7 +63,7 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln1(x))
+        x = x + self.attn(self.ln1(x)) # variance has grown
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -80,6 +81,21 @@ class GPT(nn.Module):
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+        # weight sharing scheme, see https://arxiv.org/abs/1706.03762
+        self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= 2 * self.config.n_layer ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, x, targets=None):
         B, T = x.size()
@@ -94,7 +110,11 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
 
         logits = self.lm_head(x)
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+        return logits, loss
     @classmethod
     def from_pretrained(cls, model_type):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
@@ -147,5 +167,47 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 model.to(device)
 
-import sys; sys.exit(0) # stop now for debugging
 
+# get a batch of data
+import tiktoken
+
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        with open ('input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode_ordinary(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(tokens)} tokens")
+        print(f"1 epoch = {len(tokens) // (B * T)} batches")
+
+        # state
+        self.current_pos = 0
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_pos:self.current_pos + B * T + 1]
+        x = buf[:B * T].view(B, T)
+        y = buf[1:B * T + 1].view(B, T)
+
+        self.current_pos += B * T
+
+        if self.current_pos + B * T >= len(self.tokens):
+            self.current_pos = 0
+        return x, y
+    
+train_dataloader = DataLoaderLite(B=4, T=32)
+# optimize
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_dataloader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"loss: {loss.item()}")
+
+import sys; sys.exit(0) # stop now for debugging
