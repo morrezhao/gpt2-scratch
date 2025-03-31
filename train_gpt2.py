@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import inspect
 
 @dataclass
 class GPTConfig:
@@ -46,10 +47,12 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, n_head, T, head_dim)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        attn = F.softmax(attn, dim=-1)
-        y = (attn @ v).transpose(1, 2).contiguous().view(B, T, C)
+        # attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        # attn = F.softmax(attn, dim=-1)
+        # y = (attn @ v).transpose(1, 2).contiguous().view(B, T, C)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # use flash attention
+     
         y = self.c_proj(y)
         return y
 
@@ -156,8 +159,27 @@ class GPT(nn.Module):
         
         return model
     
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device.type == 'cuda'
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+    
 model = GPT.from_pretrained('gpt2')
-
 
 # -------- try to detect device automatically --------
 device = "cpu"
@@ -166,6 +188,7 @@ if torch.cuda.is_available():
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 model.to(device)
+model = torch.compile(model=model) # faster by reducing python overhead and GPU <-> HBM read and write (节省了不必要的从GPU到HBM写回)
 
 
 # get a batch of data
@@ -199,15 +222,39 @@ class DataLoaderLite:
         return x, y
     
 train_dataloader = DataLoaderLite(B=4, T=32)
+
+max_lr = 3e-4
+min_lr = max_lr / 10
+warm_up_steps = 10
+max_steps = 50
+def get_lr(it):
+    if it < warm_up_steps:
+        return max_lr * (it + 1) / warm_up_steps
+    if it > max_steps:
+        return min_lr
+    decay_ratio = (it - warm_up_steps) / (max_steps - warm_up_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
+
+torch.set_float32_matmul_precision('high') # 8X faster in theory
 # optimize
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
+for step in range(max_steps):
     x, y = train_dataloader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        # 混合精度，logits is bfloat16，weight is float32
+        logits, loss = model(x, y)
+        import code; code.interact(local=locals())
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
     print(f"loss: {loss.item()}")
 
-import sys; sys.exit(0) # stop now for debugging
+import sys; sys.exit(0) # stop now
