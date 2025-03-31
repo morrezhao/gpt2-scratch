@@ -190,6 +190,16 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
 model.to(device)
 model = torch.compile(model=model) # faster by reducing python overhead and GPU <-> HBM read and write (节省了不必要的从GPU到HBM写回)
 
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+total_batch_size = 2 ** 19
+B = 16
+T = 1024
+assert total_batch_size % (B * T) == 0
+accumulation_steps = total_batch_size // (B * T) # 32
+print(f"total batch size: {total_batch_size}, gradient accumulation steps: {accumulation_steps}")
 
 # get a batch of data
 import tiktoken
@@ -221,7 +231,7 @@ class DataLoaderLite:
             self.current_pos = 0
         return x, y
     
-train_dataloader = DataLoaderLite(B=4, T=32)
+train_dataloader = DataLoaderLite(B=B, T=T)
 
 max_lr = 3e-4
 min_lr = max_lr / 10
@@ -242,19 +252,24 @@ torch.set_float32_matmul_precision('high') # 8X faster in theory
 # optimize
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
 for step in range(max_steps):
-    x, y = train_dataloader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        # 混合精度，logits is bfloat16，weight is float32
-        logits, loss = model(x, y)
-        import code; code.interact(local=locals())
-    loss.backward()
+    loss_accum = 0
+    for micro_step in range(accumulation_steps):
+        x, y = train_dataloader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            # 混合精度，logits is bfloat16，weight is float32
+            logits, loss = model(x, y)
+            # import code; code.interact(local=locals())
+        loss = loss / accumulation_steps
+        loss_accum += loss.detach()
+        loss.backward()
+        # L = L0 + L1 + L2 + L3 + ... + Ln -> L = 1/n * (L0 + L1 + L2 + L3 + ... + Ln)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step()
-    print(f"loss: {loss.item()}")
+    print(f"loss: {loss_accum.item()}")
 
 import sys; sys.exit(0) # stop now
