@@ -225,7 +225,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 total_batch_size = 2 ** 19
-B = 16
+B = 64
 T = 1024
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure the batch size is divisible by B * T * ddp_world_size"
 accumulation_steps = total_batch_size // (B * T * ddp_world_size) # 32 / ddp_world_size
@@ -257,9 +257,7 @@ class DataLoaderLite:
         assert len(shards) > 0, "no shards found"
         if master_process:
             print(f"found {len(shards)} shards for {split} data")
-        self.current_shard = 0
-        self.tokens = load_tokens(self.shards[self.current_shard])
-        self.current_pos = self.B * self.T * self.process_rank
+        self.reset()
 
     def reset(self):
         self.current_shard = 0
@@ -284,10 +282,10 @@ class DataLoaderLite:
 train_dataloader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, total_processes=ddp_world_size, split='train')
 val_dataloader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, total_processes=ddp_world_size, split='val')
 
-max_lr = 3e-4
+max_lr = 6e-4
 min_lr = max_lr / 10
-warm_up_steps = 10
-max_steps = 50
+warm_up_steps = 715
+max_steps = 19073
 def get_lr(it):
     if it < warm_up_steps:
         return max_lr * (it + 1) / warm_up_steps
@@ -332,7 +330,17 @@ for step in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG) # 在all the RANK上平均loss
         if master_process:
             print(f"val loss: {val_loss_accum.item():.4f}")
-    
+            with open(log_file, "a") as f:
+                f.write(f"step {step}, val loss: {val_loss_accum.item():.4f}\n")
+            if step > 0 and (step % 1000 == 0 or last_step):
+                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'config': raw_model.config,
+                    'step': step,
+                    'val_loss': val_loss_accum.item(),
+                }
+                torch.save(checkpoint, checkpoint_path)
     
     # training loop
     model.train()
