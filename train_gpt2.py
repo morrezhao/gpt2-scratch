@@ -217,7 +217,8 @@ model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 model = torch.compile(model=model) # faster by reducing python overhead and GPU <-> HBM read and write (节省了不必要的从GPU到HBM写回)
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])  
+    model = DDP(model, device_ids=[ddp_local_rank]) 
+raw_model = model.module if ddp else model 
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
@@ -233,24 +234,38 @@ if master_process:
 
 # get a batch of data
 import tiktoken
+import numpy as np
+
+def load_tokens(filename):
+    npt = np.load(filename)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
 
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, total_processes):
+    def __init__(self, B, T, process_rank, total_processes, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.total_processes = total_processes
+        assert split in {'train', 'val'}
 
-        with open('input.txt', 'r') as f:
-            text = f.read()
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode_ordinary(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"loaded {len(tokens)} tokens")
-        print(f"1 epoch = {len(tokens) // (B * T)} batches")
-
-        # state
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [f for f in shards if split in f]
+        shards = sorted(shards)
+        self.shards = shards
+        assert len(shards) > 0, "no shards found"
+        if master_process:
+            print(f"found {len(shards)} shards for {split} data")
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_pos = self.B * self.T * self.process_rank
+
+    def reset(self):
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_pos = self.B * self.T * self.process_rank
+
     def next_batch(self):
         B, T = self.B, self.T
         buf = self.tokens[self.current_pos : self.current_pos + B*T+1]
@@ -259,11 +274,15 @@ class DataLoaderLite:
 
         self.current_pos += B * T * self.total_processes
 
+        # move to next shard
         if self.current_pos + B * T >= len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
             self.current_pos = self.B * self.T * self.process_rank
         return x, y
     
-train_dataloader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, total_processes=ddp_world_size)
+train_dataloader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, total_processes=ddp_world_size, split='train')
+val_dataloader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, total_processes=ddp_world_size, split='val')
 
 max_lr = 3e-4
 min_lr = max_lr / 10
@@ -282,8 +301,41 @@ def get_lr(it):
 
 torch.set_float32_matmul_precision('high') # 8X faster in theory
 # optimize
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
+
+# create the log directory
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f:
+    pass
+
+
 for step in range(max_steps):
+
+    last_step = (step == max_steps - 1)
+
+    if step % 250 == 0 or last_step:
+        model.eval()
+        val_dataloader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_dataloader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG) # 在all the RANK上平均loss
+        if master_process:
+            print(f"val loss: {val_loss_accum.item():.4f}")
+    
+    
+    # training loop
+    model.train()
     optimizer.zero_grad()
     loss_accum = 0
     for micro_step in range(accumulation_steps):
@@ -312,5 +364,5 @@ for step in range(max_steps):
 
 if ddp:
     destroy_process_group()
-    
+
 import sys; sys.exit(0) # stop now
